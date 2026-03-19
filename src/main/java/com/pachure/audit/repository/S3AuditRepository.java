@@ -43,7 +43,8 @@ public class S3AuditRepository {
     }
 
     /**
-     * Save records using DuckDB, stream Parquet directly to S3.
+     * Save records using DuckDB and export directly to S3.
+     * Uses DuckDB's S3 extension for streaming write.
      */
     public void batchSave(List<AuditRecord> records) {
         if (records.isEmpty()) return;
@@ -81,23 +82,44 @@ public class S3AuditRepository {
                     ps.executeBatch();
                 }
 
-                // Export to local Parquet first (fast)
-                String localParquetFile = "/tmp/stream_" + monthKey + ".parquet";
-                conn.createStatement().execute(
-                    "COPY audit_records TO '" + localParquetFile + "' (FORMAT PARQUET)"
-                );
+                // Load httpfs extension and configure for MinIO
+                conn.createStatement().execute("INSTALL httpfs;");
+                conn.createStatement().execute("LOAD httpfs");
+                
+                // Configure MinIO S3 settings
+                conn.createStatement().execute("SET s3_endpoint='localhost:9000'");
+                conn.createStatement().execute("SET s3_access_key_id='minioadmin'");
+                conn.createStatement().execute("SET s3_secret_access_key='minioadmin'");
+                conn.createStatement().execute("SET s3_use_ssl=false");
+                conn.createStatement().execute("SET s3_region='us-east-1'");
+                // Force path-style addressing for MinIO
+                conn.createStatement().execute("SET s3_url_style='path'");
 
-                // Stream upload to S3 using PutObject with explicit content length
-                streamToS3(monthKey, localParquetFile);
+                // Now try native S3 export
+                String s3Path = String.format("s3://%s/audit/%s.parquet", bucket, monthKey);
 
-                // Cleanup
-                new File(localParquetFile).delete();
+                try {
+                    conn.createStatement().execute(
+                        "COPY audit_records TO '" + s3Path + "' (FORMAT PARQUET)"
+                    );
+                    log.info("Native S3 export successful for {}", monthKey);
+                } catch (SQLException e) {
+                    // Fallback to Java streaming
+                    log.warn("Native S3 failed, using Java stream: {}", e.getMessage());
+                    
+                    String localParquetFile = "/tmp/stream_" + monthKey + ".parquet";
+                    conn.createStatement().execute(
+                        "COPY audit_records TO '" + localParquetFile + "' (FORMAT PARQUET)"
+                    );
+                    streamToS3(monthKey, localParquetFile);
+                    new File(localParquetFile).delete();
+                }
 
-                log.info("Streamed {} records to S3 Parquet for {}", monthRecords.size(), monthKey);
+                log.info("Saved {} records to S3 Parquet for {}", monthRecords.size(), monthKey);
 
             } catch (Exception e) {
-                log.error("Failed to save to S3: {}", e.getMessage());
-                throw new RuntimeException("S3 save failed", e);
+                log.error("Failed to save: {}", e.getMessage());
+                throw new RuntimeException("Save failed", e);
             }
         }
     }
