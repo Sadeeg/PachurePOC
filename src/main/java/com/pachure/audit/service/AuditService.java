@@ -1,68 +1,87 @@
 package com.pachure.audit.service;
 
 import com.pachure.audit.model.AuditRecord;
-import com.pachure.audit.repository.AuditRepository;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
+import com.pachure.audit.repository.S3AuditRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.time.Instant;
 import java.util.List;
-import java.util.Map;
-import java.util.UUID;
+import java.util.Optional;
 
 /**
- * Service layer for audit record operations.
+ * Service for audit record operations.
+ * Uses S3 repository for storage.
  */
 @Service
-@RequiredArgsConstructor
-@Slf4j
 public class AuditService {
 
-    private final AuditRepository auditRepository;
+    private static final Logger log = LoggerFactory.getLogger(AuditService.class);
+
+    private final S3AuditRepository repository;
+
+    @Autowired
+    public AuditService(S3AuditRepository repository) {
+        this.repository = repository;
+    }
 
     /**
      * Initialize the audit storage.
      */
     public void initialize() {
-        auditRepository.initializeTable();
+        log.info("Initializing S3 audit storage");
+        // S3 bucket is created automatically
     }
 
     /**
-     * Create a new audit record.
+     * Save a single audit record.
      */
-    public AuditRecord createAuditRecord(Map<String, Object> payload) {
-        AuditRecord record = AuditRecord.builder()
-                .id(UUID.randomUUID().toString())
-                .timestamp(Instant.now())
-                .payload(payload)
-                .build();
-        
-        auditRepository.insert(record);
-        log.debug("Created audit record: {}", record.getId());
-        
+    public AuditRecord save(AuditRecord record) {
+        if (record.getId() == null) {
+            record.setId(java.util.UUID.randomUUID().toString());
+        }
+        if (record.getTimestamp() == null) {
+            record.setTimestamp(Instant.now());
+        }
+        repository.save(record);
         return record;
     }
 
     /**
-     * Query audit records by timestamp range.
+     * Save multiple audit records.
      */
-    public List<AuditRecord> queryByTimeRange(Instant from, Instant to) {
-        log.debug("Querying records from {} to {}", from, to);
-        return auditRepository.findByTimestampBetween(from, to);
+    public void batchSave(List<AuditRecord> records) {
+        repository.batchSave(records);
     }
 
     /**
-     * Get total record count.
+     * Find records by timestamp range.
      */
-    public long getTotalCount() {
-        return auditRepository.count();
+    public List<AuditRecord> findByTimestampBetween(Instant from, Instant to) {
+        return repository.findByTimestampBetween(from, to);
     }
 
     /**
-     * Get current storage size in bytes.
+     * Count all records.
+     */
+    public long count() {
+        return repository.count();
+    }
+
+    /**
+     * Get storage size in bytes.
      */
     public long getStorageSize() {
-        return auditRepository.getStorageSize();
+        return repository.getStorageSize();
+    }
+
+    /**
+     * Find a single record by ID.
+     */
+    public Optional<AuditRecord> findById(String id) {
+        // S3 implementation - would need list + filter
+        return Optional.empty();
     }
 }

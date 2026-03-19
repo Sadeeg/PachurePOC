@@ -2,77 +2,72 @@ package com.pachure.audit.controller;
 
 import com.pachure.audit.model.AuditRecord;
 import com.pachure.audit.service.AuditService;
-import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.Instant;
-import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Map;
 
 /**
- * REST controller for audit log operations.
+ * REST controller for audit operations.
  */
 @RestController
 @RequestMapping("/api/audit")
-@RequiredArgsConstructor
 public class AuditController {
 
     private final AuditService auditService;
 
-    /**
-     * Create a new audit record.
-     * POST /api/audit
-     * Body: { "key": "value", ... }
-     */
-    @PostMapping
-    public ResponseEntity<AuditRecord> createAuditRecord(@RequestBody Map<String, Object> payload) {
-        AuditRecord record = auditService.createAuditRecord(payload);
-        return ResponseEntity.ok(record);
+    @Autowired
+    public AuditController(AuditService auditService) {
+        this.auditService = auditService;
     }
 
     /**
-     * Query audit records by time range.
-     * GET /api/audit?from=2024-01-01T00:00:00Z&to=2024-01-02T00:00:00Z
+     * Create a new audit record.
+     */
+    @PostMapping
+    public ResponseEntity<AuditRecord> createAuditRecord(@RequestBody Map<String, Object> payload) {
+        AuditRecord record = AuditRecord.builder()
+                .timestamp(Instant.now())
+                .payload(payload)
+                .build();
+        AuditRecord saved = auditService.save(record);
+        return ResponseEntity.ok(saved);
+    }
+
+    /**
+     * Query audit records by timestamp range.
      */
     @GetMapping
-    public ResponseEntity<List<AuditRecord>> queryAuditRecords(
+    public ResponseEntity<List<AuditRecord>> queryByTimeRange(
             @RequestParam Instant from,
             @RequestParam Instant to) {
-        
-        List<AuditRecord> records = auditService.queryByTimeRange(from, to);
+        List<AuditRecord> records = auditService.findByTimestampBetween(from, to);
         return ResponseEntity.ok(records);
     }
 
     /**
      * Get total record count.
-     * GET /api/audit/count
      */
     @GetMapping("/count")
-    public ResponseEntity<Long> getCount() {
-        return ResponseEntity.ok(auditService.getTotalCount());
+    public ResponseEntity<Long> getTotalCount() {
+        return ResponseEntity.ok(auditService.count());
     }
 
     /**
-     * Get storage size in bytes.
-     * GET /api/audit/storage-size
+     * Get storage statistics.
      */
-    @GetMapping("/storage-size")
-    public ResponseEntity<Long> getStorageSize() {
-        return ResponseEntity.ok(auditService.getStorageSize());
-    }
-
-    /**
-     * Health check.
-     * GET /api/audit/health
-     */
-    @GetMapping("/health")
-    public ResponseEntity<Map<String, Object>> health() {
+    @GetMapping("/storage")
+    public ResponseEntity<Map<String, Object>> getStorageInfo() {
+        long count = auditService.count();
+        long size = auditService.getStorageSize();
+        
         return ResponseEntity.ok(Map.of(
-            "status", "UP",
-            "totalRecords", auditService.getTotalCount(),
-            "storageBytes", auditService.getStorageSize()
+                "recordCount", count,
+                "storageBytes", size,
+                "avgBytesPerRecord", count > 0 ? size / count : 0
         ));
     }
 }
