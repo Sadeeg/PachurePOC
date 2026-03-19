@@ -117,10 +117,9 @@ class AuditBenchmarkTest {
      */
     @Test
     void testQueryPerformance() {
-        // First, insert some data if not present
-        if (auditRepository.count() < QUERY_RECORD_COUNT) {
-            insertTestData(QUERY_RECORD_COUNT * 10);
-        }
+        // Always insert fresh test data for query - ignore existing data
+        // 200 records * 10 = 2000 records to get ~200 in query window
+        insertTestData(QUERY_RECORD_COUNT * 10);
         
         // Determine time range that should return ~200 records
         // 20 records/hour = 1 record every 3 minutes
@@ -203,41 +202,97 @@ class AuditBenchmarkTest {
     }
 
     /**
-     * Helper: Generate a payload of approximately the target size.
+     * Helper: Generate realistic variable payloads.
+     * Different sizes, structures, and content.
      */
     private Map<String, Object> generatePayload(int targetBytes) {
         Map<String, Object> payload = new HashMap<>();
         
-        // Estimate overhead for JSON serialization
-        // Add padding fields to reach target size
-        StringBuilder sb = new StringBuilder();
-        while (sb.length() < targetBytes - 100) {
-            sb.append("x");
+        // Random action types
+        String[] actions = {"CREATE", "UPDATE", "DELETE", "READ", "LOGIN", "LOGOUT", "EXPORT", "IMPORT"};
+        String[] resources = {"user", "order", "product", "invoice", "document", "session", "payment", "customer"};
+        
+        String action = actions[(int) (Math.random() * actions.length)];
+        String resource = resources[(int) (Math.random() * resources.length)];
+        String resourceId = java.util.UUID.randomUUID().toString().substring(0, 8);
+        
+        payload.put("id", java.util.UUID.randomUUID().toString());
+        payload.put("timestamp", Instant.now().toString());
+        payload.put("action", action);
+        payload.put("resourceType", resource);
+        payload.put("resourceId", resourceId);
+        payload.put("userId", "user-" + (int) (Math.random() * 10000));
+        
+        // Different payload structures based on action
+        if ("CREATE".equals(action) || "UPDATE".equals(action)) {
+            Map<String, Object> changes = new HashMap<>();
+            int fieldCount = 1 + (int) (Math.random() * 8); // 1-8 fields changed
+            for (int i = 0; i < fieldCount; i++) {
+                changes.put("field_" + i, "value_" + (int) (Math.random() * 1000));
+            }
+            payload.put("changes", changes);
+        } else if ("DELETE".equals(action)) {
+            payload.put("softDelete", Math.random() > 0.5);
+            payload.put("reason", "reason_" + (int) (Math.random() * 100));
+        } else if ("LOGIN".equals(action) || "LOGOUT".equals(action)) {
+            payload.put("ipAddress", "192.168." + (int) (Math.random() * 255) + "." + (int) (Math.random() * 255));
+            payload.put("userAgent", "Mozilla/5.0-" + java.util.UUID.randomUUID().toString().substring(0, 20));
+            payload.put("sessionId", java.util.UUID.randomUUID().toString());
         }
         
-        payload.put("event", "audit_event_" + System.currentTimeMillis());
-        payload.put("data", sb.toString());
-        payload.put("metadata", Map.of(
-            "source", "poc_test",
-            "version", "1.0"
-        ));
+        // Add variable-sized data to reach target
+        // Average 2KB with variance: 1KB to 3KB
+        int baseSize = 300; // estimated base JSON size
+        int targetDataSize = 1000 + (int) (Math.random() * 2000); // 1000-3000 bytes (avg ~2KB)
+        
+        StringBuilder sb = new StringBuilder();
+        while (sb.length() < targetDataSize) {
+            sb.append(java.util.UUID.randomUUID().toString().replace("-", ""));
+        }
+        payload.put("data", sb.substring(0, targetDataSize));
+        
+        // Some records have nested metadata, some don't
+        if (Math.random() > 0.3) {
+            Map<String, Object> metadata = new HashMap<>();
+            metadata.put("requestId", java.util.UUID.randomUUID().toString());
+            metadata.put("correlationId", java.util.UUID.randomUUID().toString());
+            metadata.put("clientId", "client-" + (int) (Math.random() * 100));
+            metadata.put("environment", Math.random() > 0.5 ? "production" : "staging");
+            if (Math.random() > 0.5) {
+                metadata.put("extra", java.util.UUID.randomUUID().toString().substring(0, 16));
+            }
+            payload.put("metadata", metadata);
+        }
+        
+        // Some have tags
+        if (Math.random() > 0.6) {
+            payload.put("tags", new String[]{"tag1", "tag2", "tag3"});
+        }
         
         return payload;
     }
 
     /**
      * Helper: Insert test data for query testing.
+     * Generates realistic distribution: 20 records/hour over 24 hours = 480 records.
      */
     private void insertTestData(int count) {
-        Map<String, Object> payload = generatePayload(RECORD_SIZE_BYTES);
+        // Generate variable payloads
         List<AuditRecord> records = new ArrayList<>(count);
         Instant baseTime = Instant.now().minus(24, ChronoUnit.HOURS);
         
         for (int i = 0; i < count; i++) {
+            // 20 records/hour = 1 record every 3 minutes = 180 seconds
+            Instant timestamp = baseTime.plus(i * 180L, ChronoUnit.SECONDS);
+            
+            // Variable payload size: 1-3KB
+            int size = 1000 + (int) (Math.random() * 2000);
+            Map<String, Object> payload = generatePayload(size);
+            
             AuditRecord record = AuditRecord.builder()
                     .id(java.util.UUID.randomUUID().toString())
-                    .timestamp(baseTime.plus(i * 180, ChronoUnit.MILLIS)) // 20/hour
-                    .payload(new HashMap<>(payload))
+                    .timestamp(timestamp)
+                    .payload(payload)
                     .build();
             records.add(record);
         }
