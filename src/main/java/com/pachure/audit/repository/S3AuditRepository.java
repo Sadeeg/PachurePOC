@@ -53,19 +53,20 @@ public class S3AuditRepository {
 
     /**
      * Save records using DuckDB and export to Parquet in S3.
+     * Partitioned by MONTH.
      */
     public void batchSave(List<AuditRecord> records) {
         if (records.isEmpty()) return;
 
-        // Group by date
-        Map<String, List<AuditRecord>> byDate = records.stream()
+        // Group by month (YYYY-MM)
+        Map<String, List<AuditRecord>> byMonth = records.stream()
                 .collect(Collectors.groupingBy(r ->
                         LocalDate.ofInstant(r.getTimestamp(), ZoneOffset.UTC)
-                                .format(DateTimeFormatter.ISO_DATE)));
+                                .format(DateTimeFormatter.ofPattern("yyyy-MM"))));
 
-        for (Map.Entry<String, List<AuditRecord>> entry : byDate.entrySet()) {
-            String dateKey = entry.getKey();
-            List<AuditRecord> dayRecords = entry.getValue();
+        for (Map.Entry<String, List<AuditRecord>> entry : byMonth.entrySet()) {
+            String monthKey = entry.getKey();
+            List<AuditRecord> monthRecords = entry.getValue();
 
             try (Connection conn = getConnection()) {
                 // Create table
@@ -80,7 +81,7 @@ public class S3AuditRepository {
                 // Insert records using prepared statement
                 String sql = "INSERT INTO audit_records (id, timestamp, payload) VALUES (?, ?, ?)";
                 try (PreparedStatement ps = conn.prepareStatement(sql)) {
-                    for (AuditRecord record : dayRecords) {
+                    for (AuditRecord record : monthRecords) {
                         ps.setString(1, record.getId());
                         ps.setTimestamp(2, record.getTimestamp() != null ?
                                 Timestamp.from(record.getTimestamp()) : Timestamp.from(Instant.now()));
@@ -91,18 +92,18 @@ public class S3AuditRepository {
                 }
 
                 // Export to Parquet locally first
-                String localParquetFile = "/tmp/audit_" + dateKey + ".parquet";
+                String localParquetFile = "/tmp/audit_" + monthKey + ".parquet";
                 conn.createStatement().execute(
                     "COPY audit_records TO '" + localParquetFile + "' (FORMAT PARQUET)"
                 );
 
                 // Upload to S3 using multipart streaming
-                uploadParquetToS3(dateKey, localParquetFile);
+                uploadParquetToS3(monthKey, localParquetFile);
 
                 // Cleanup local file
                 new File(localParquetFile).delete();
 
-                log.info("Saved {} records to S3 Parquet for {}", dayRecords.size(), dateKey);
+                log.info("Saved {} records to S3 Parquet for {}", monthRecords.size(), monthKey);
 
             } catch (Exception e) {
                 log.error("Failed to save to DuckDB/S3: {}", e.getMessage());
@@ -139,18 +140,24 @@ public class S3AuditRepository {
 
     /**
      * Query records by timestamp range.
-     * Downloads Parquet files and queries with DuckDB.
+     * Downloads Parquet files by MONTH and queries with DuckDB.
      */
     public List<AuditRecord> findByTimestampBetween(Instant from, Instant to) {
         List<AuditRecord> results = new ArrayList<>();
 
-        LocalDate fromDate = LocalDate.ofInstant(from, ZoneOffset.UTC);
-        LocalDate toDate = LocalDate.ofInstant(to, ZoneOffset.UTC);
+        // Get month keys in range
+        String fromMonth = LocalDate.ofInstant(from, ZoneOffset.UTC)
+                .format(DateTimeFormatter.ofPattern("yyyy-MM"));
+        String toMonth = LocalDate.ofInstant(to, ZoneOffset.UTC)
+                .format(DateTimeFormatter.ofPattern("yyyy-MM"));
 
-        // Download and process each day's Parquet file
-        for (LocalDate date = fromDate; !date.isAfter(toDate); date = date.plusDays(1)) {
-            String dateKey = date.format(DateTimeFormatter.ISO_DATE);
-            String objectKey = "audit/" + dateKey + ".parquet";
+        // Download and process each month's Parquet file
+        for (LocalDate date = LocalDate.ofInstant(from, ZoneOffset.UTC);
+             !date.isAfter(LocalDate.ofInstant(to, ZoneOffset.UTC));
+             date = date.plusMonths(1)) {
+            
+            String monthKey = date.format(DateTimeFormatter.ofPattern("yyyy-MM"));
+            String objectKey = "audit/" + monthKey + ".parquet";
 
             try {
                 // Download Parquet from S3
@@ -164,7 +171,7 @@ public class S3AuditRepository {
                 byte[] parquetData = baos.toByteArray();
 
                 // Save to temp file for DuckDB
-                String tempFile = "/tmp/query_" + dateKey + ".parquet";
+                String tempFile = "/tmp/query_" + monthKey + ".parquet";
                 java.nio.file.Files.write(java.nio.file.Path.of(tempFile), parquetData);
 
                 // Query with DuckDB
