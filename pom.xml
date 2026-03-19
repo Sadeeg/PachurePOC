@@ -41,8 +41,8 @@
         <!-- DuckDB -->
         <dependency>
             <groupId>org.duckdb</groupId>
-            <artifactId>duckdb-jdbc</artifactId>
-            <version>0.10.1</version>
+            <artifactId>duckdb_jdbc</artifactId>
+            <version>1.3.1.0</version>
         </dependency>
         
         <!-- JSON -->

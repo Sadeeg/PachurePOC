@@ -62,7 +62,7 @@ public class AuditRepository {
         
         jdbcTemplate.update(sql, 
             record.getId() != null ? record.getId() : UUID.randomUUID().toString(),
-            record.getTimestamp() != null ? record.getTimestamp() : Instant.now(),
+            record.getTimestamp() != null ? java.sql.Timestamp.from(record.getTimestamp()) : java.sql.Timestamp.from(Instant.now()),
             record.getPayloadAsJson()
         );
     }
@@ -78,7 +78,8 @@ public class AuditRepository {
         
         jdbcTemplate.batchUpdate(sql, records, records.size(), (ps, record) -> {
             ps.setString(1, record.getId() != null ? record.getId() : UUID.randomUUID().toString());
-            ps.setObject(2, record.getTimestamp() != null ? record.getTimestamp() : Instant.now());
+            ps.setTimestamp(2, record.getTimestamp() != null ? 
+                java.sql.Timestamp.from(record.getTimestamp()) : java.sql.Timestamp.from(Instant.now()));
             ps.setString(3, record.getPayloadAsJson());
         });
         
@@ -108,7 +109,7 @@ public class AuditRepository {
                 .build();
             record.setPayloadFromJson(rs.getString("payload"));
             return record;
-        }, from, to);
+        }, java.sql.Timestamp.from(from), java.sql.Timestamp.from(to));
     }
 
     /**
@@ -121,7 +122,8 @@ public class AuditRepository {
             WHERE timestamp >= ? AND timestamp <= ?
             """;
         
-        Long count = jdbcTemplate.queryForObject(sql, Long.class, from, to);
+        Long count = jdbcTemplate.queryForObject(sql, Long.class, 
+            java.sql.Timestamp.from(from), java.sql.Timestamp.from(to));
         return count != null ? count : 0;
     }
 
