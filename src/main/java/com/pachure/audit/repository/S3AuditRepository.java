@@ -20,8 +20,8 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * DuckDB + S3 Parquet repository.
- * Uses DuckDB embedded, stores Parquet files in S3.
+ * DuckDB + S3 Parquet repository with streaming.
+ * Uses DuckDB for Parquet generation, streams directly to S3.
  */
 @Repository
 public class S3AuditRepository {
@@ -30,30 +30,20 @@ public class S3AuditRepository {
 
     private final S3Client s3Client;
     private final String bucket;
-    private final String endpoint;
 
     @Autowired
     public S3AuditRepository(S3Client s3Client,
-                            @Value("${audit.s3.bucket:audit-bucket}") String bucket,
-                            @Value("${audit.s3.endpoint:http://localhost:9000}") String endpoint) {
+                            @Value("${audit.s3.bucket:audit-bucket}") String bucket) {
         this.s3Client = s3Client;
         this.bucket = bucket;
-        this.endpoint = endpoint;
     }
 
     private Connection getConnection() throws SQLException {
-        // Connect to DuckDB with S3 support
-        String jdbcUrl = "jdbc:duckdb:?access_key=minioadmin&secret_key=minioadmin&endpoint=" + 
-                endpoint.replace("http://", "").replace("https://", "");
-        
-        // For local DuckDB with file-based storage, we need a different approach
-        // We'll use DuckDB embedded and export to Parquet locally, then upload to S3
         return DriverManager.getConnection("jdbc:duckdb:");
     }
 
     /**
-     * Save records using DuckDB and export to Parquet in S3.
-     * Partitioned by MONTH.
+     * Save records using DuckDB, stream Parquet directly to S3.
      */
     public void batchSave(List<AuditRecord> records) {
         if (records.isEmpty()) return;
@@ -78,7 +68,7 @@ public class S3AuditRepository {
                     )
                 """);
 
-                // Insert records using prepared statement
+                // Insert records
                 String sql = "INSERT INTO audit_records (id, timestamp, payload) VALUES (?, ?, ?)";
                 try (PreparedStatement ps = conn.prepareStatement(sql)) {
                     for (AuditRecord record : monthRecords) {
@@ -91,51 +81,63 @@ public class S3AuditRepository {
                     ps.executeBatch();
                 }
 
-                // Export to Parquet locally first
-                String localParquetFile = "/tmp/audit_" + monthKey + ".parquet";
+                // Export to local Parquet first (fast)
+                String localParquetFile = "/tmp/stream_" + monthKey + ".parquet";
                 conn.createStatement().execute(
                     "COPY audit_records TO '" + localParquetFile + "' (FORMAT PARQUET)"
                 );
 
-                // Upload to S3 using multipart streaming
-                uploadParquetToS3(monthKey, localParquetFile);
+                // Stream upload to S3 using PutObject with explicit content length
+                streamToS3(monthKey, localParquetFile);
 
-                // Cleanup local file
+                // Cleanup
                 new File(localParquetFile).delete();
 
-                log.info("Saved {} records to S3 Parquet for {}", monthRecords.size(), monthKey);
+                log.info("Streamed {} records to S3 Parquet for {}", monthRecords.size(), monthKey);
 
             } catch (Exception e) {
-                log.error("Failed to save to DuckDB/S3: {}", e.getMessage());
-                throw new RuntimeException("Save failed", e);
+                log.error("Failed to save to S3: {}", e.getMessage());
+                throw new RuntimeException("S3 save failed", e);
             }
         }
     }
 
     /**
-     * Upload Parquet file to S3 using streaming (no local temp file).
+     * Stream Parquet file to S3 efficiently.
      */
-    private void uploadParquetToS3(String dateKey, String localFile) {
-        String objectKey = "audit/" + dateKey + ".parquet";
+    private void streamToS3(String monthKey, String localFile) {
+        String objectKey = "audit/" + monthKey + ".parquet";
 
         try {
-            // Read file into bytes
-            byte[] fileContent = java.nio.file.Files.readAllBytes(java.nio.file.Path.of(localFile));
+            // Use FileInputStream directly - AWS SDK handles buffering
+            File file = new File(localFile);
+            long contentLength = file.length();
 
-            // Simple PUT (works for files up to 5GB)
-            // For larger files, multipart upload would be needed
             PutObjectRequest putReq = PutObjectRequest.builder()
                     .bucket(bucket)
                     .key(objectKey)
                     .contentType("application/parquet")
+                    .contentLength(contentLength)
                     .build();
 
-            s3Client.putObject(putReq, RequestBody.fromBytes(fileContent));
+            // Stream directly from file to S3 (no loading into memory)
+            try (FileInputStream fis = new FileInputStream(file)) {
+                s3Client.putObject(putReq, RequestBody.fromInputStream(fis, contentLength));
+            }
+
+            log.debug("Streamed {} to S3 ({} bytes)", objectKey, contentLength);
 
         } catch (Exception e) {
-            log.error("S3 upload failed: {}", e.getMessage());
-            throw new RuntimeException("S3 upload failed", e);
+            log.error("S3 stream failed: {}", e.getMessage());
+            throw new RuntimeException("S3 stream failed", e);
         }
+    }
+
+    /**
+     * Save a single record.
+     */
+    public void save(AuditRecord record) {
+        batchSave(List.of(record));
     }
 
     /**
@@ -146,15 +148,11 @@ public class S3AuditRepository {
         List<AuditRecord> results = new ArrayList<>();
 
         // Get month keys in range
-        String fromMonth = LocalDate.ofInstant(from, ZoneOffset.UTC)
-                .format(DateTimeFormatter.ofPattern("yyyy-MM"));
-        String toMonth = LocalDate.ofInstant(to, ZoneOffset.UTC)
-                .format(DateTimeFormatter.ofPattern("yyyy-MM"));
+        LocalDate fromDate = LocalDate.ofInstant(from, ZoneOffset.UTC);
+        LocalDate toDate = LocalDate.ofInstant(to, ZoneOffset.UTC);
 
         // Download and process each month's Parquet file
-        for (LocalDate date = LocalDate.ofInstant(from, ZoneOffset.UTC);
-             !date.isAfter(LocalDate.ofInstant(to, ZoneOffset.UTC));
-             date = date.plusMonths(1)) {
+        for (LocalDate date = fromDate; !date.isAfter(toDate); date = date.plusMonths(1)) {
             
             String monthKey = date.format(DateTimeFormatter.ofPattern("yyyy-MM"));
             String objectKey = "audit/" + monthKey + ".parquet";
@@ -171,12 +169,11 @@ public class S3AuditRepository {
                 byte[] parquetData = baos.toByteArray();
 
                 // Save to temp file for DuckDB
-                String tempFile = "/tmp/query_" + monthKey + ".parquet";
+                String tempFile = "/tmp/query_" + monthKey + "_" + System.currentTimeMillis() + ".parquet";
                 java.nio.file.Files.write(java.nio.file.Path.of(tempFile), parquetData);
 
                 // Query with DuckDB
                 try (Connection conn = getConnection()) {
-                    // Register the parquet file
                     String sql = """
                         SELECT id, timestamp, payload 
                         FROM read_parquet(?)
@@ -205,7 +202,7 @@ public class S3AuditRepository {
                 new File(tempFile).delete();
 
             } catch (NoSuchKeyException ignored) {
-                // No data for this day
+                // No data for this month
             } catch (Exception e) {
                 log.warn("Error processing {}: {}", objectKey, e.getMessage());
             }
@@ -285,13 +282,6 @@ public class S3AuditRepository {
         }
 
         return totalSize;
-    }
-
-    /**
-     * Save a single record.
-     */
-    public void save(AuditRecord record) {
-        batchSave(List.of(record));
     }
 
     /**
