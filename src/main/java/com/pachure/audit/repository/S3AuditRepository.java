@@ -164,69 +164,61 @@ public class S3AuditRepository {
 
     /**
      * Query records by timestamp range.
-     * Downloads Parquet files by MONTH and queries with DuckDB.
+     * Uses DuckDB's S3 streaming - no file download needed!
      */
     public List<AuditRecord> findByTimestampBetween(Instant from, Instant to) {
         List<AuditRecord> results = new ArrayList<>();
 
-        // Get month keys in range
         LocalDate fromDate = LocalDate.ofInstant(from, ZoneOffset.UTC);
         LocalDate toDate = LocalDate.ofInstant(to, ZoneOffset.UTC);
 
-        // Download and process each month's Parquet file
+        // Process each month's Parquet file using S3 streaming
         for (LocalDate date = fromDate; !date.isAfter(toDate); date = date.plusMonths(1)) {
             
             String monthKey = date.format(DateTimeFormatter.ofPattern("yyyy-MM"));
-            String objectKey = "audit/" + monthKey + ".parquet";
 
-            try {
-                // Download Parquet from S3
-                GetObjectRequest getReq = GetObjectRequest.builder()
-                        .bucket(bucket)
-                        .key(objectKey)
-                        .build();
+            try (Connection conn = getConnection()) {
+                // Configure S3 for MinIO
+                conn.createStatement().execute("INSTALL httpfs;");
+                conn.createStatement().execute("LOAD httpfs");
+                conn.createStatement().execute("SET s3_endpoint='localhost:9000'");
+                conn.createStatement().execute("SET s3_access_key_id='minioadmin'");
+                conn.createStatement().execute("SET s3_secret_access_key='minioadmin'");
+                conn.createStatement().execute("SET s3_use_ssl=false");
+                conn.createStatement().execute("SET s3_region='us-east-1'");
+                conn.createStatement().execute("SET s3_url_style='path'");
 
-                ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                s3Client.getObject(getReq).transferTo(baos);
-                byte[] parquetData = baos.toByteArray();
+                // Direct S3 streaming query - no download!
+                String s3Path = String.format(
+                    "s3://%s/audit/%s.parquet", bucket, monthKey);
 
-                // Save to temp file for DuckDB
-                String tempFile = "/tmp/query_" + monthKey + "_" + System.currentTimeMillis() + ".parquet";
-                java.nio.file.Files.write(java.nio.file.Path.of(tempFile), parquetData);
+                String sql = """
+                    SELECT id, timestamp, payload 
+                    FROM read_parquet(?)
+                    WHERE timestamp >= ? AND timestamp <= ?
+                    ORDER BY timestamp
+                """;
 
-                // Query with DuckDB
-                try (Connection conn = getConnection()) {
-                    String sql = """
-                        SELECT id, timestamp, payload 
-                        FROM read_parquet(?)
-                        WHERE timestamp >= ? AND timestamp <= ?
-                        ORDER BY timestamp
-                    """;
+                try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                    ps.setString(1, s3Path);
+                    ps.setTimestamp(2, Timestamp.from(from));
+                    ps.setTimestamp(3, Timestamp.from(to));
 
-                    try (PreparedStatement ps = conn.prepareStatement(sql)) {
-                        ps.setString(1, tempFile);
-                        ps.setTimestamp(2, Timestamp.from(from));
-                        ps.setTimestamp(3, Timestamp.from(to));
-
-                        ResultSet rs = ps.executeQuery();
-                        while (rs.next()) {
-                            AuditRecord record = AuditRecord.builder()
-                                    .id(rs.getString("id"))
-                                    .timestamp(rs.getTimestamp("timestamp").toInstant())
-                                    .build();
-                            record.setPayloadFromJson(rs.getString("payload"));
-                            results.add(record);
-                        }
+                    ResultSet rs = ps.executeQuery();
+                    while (rs.next()) {
+                        AuditRecord record = AuditRecord.builder()
+                                .id(rs.getString("id"))
+                                .timestamp(rs.getTimestamp("timestamp").toInstant())
+                                .build();
+                        record.setPayloadFromJson(rs.getString("payload"));
+                        results.add(record);
                     }
                 }
 
-                // Cleanup temp file
-                new File(tempFile).delete();
-
-            } catch (NoSuchKeyException ignored) {
+            } catch (SQLException ignored) {
                 // No data for this month
             } catch (Exception e) {
-                log.warn("Error processing {}: {}", objectKey, e.getMessage());
+                log.warn("Error processing {}: {}", monthKey, e.getMessage());
             }
         }
 
@@ -234,44 +226,54 @@ public class S3AuditRepository {
     }
 
     /**
-     * Count all records in S3 Parquet files.
+     * Count all records using S3 streaming.
      */
     public long count() {
         long total = 0;
 
         try {
+            // List all Parquet files in S3
             ListObjectsV2Request listReq = ListObjectsV2Request.builder()
                     .bucket(bucket)
                     .prefix("audit/")
                     .build();
 
             ListObjectsV2Response response = s3Client.listObjectsV2(listReq);
-
+            List<String> parquetFiles = new ArrayList<>();
+            
             for (S3Object obj : response.contents()) {
-                if (!obj.key().endsWith(".parquet")) continue;
+                if (obj.key().endsWith(".parquet")) {
+                    // Extract month key from filename
+                    String key = obj.key(); // e.g., "audit/2025-08.parquet"
+                    String monthKey = key.replace("audit/", "").replace(".parquet", "");
+                    parquetFiles.add(monthKey);
+                }
+            }
 
-                // Download and count
-                GetObjectRequest getReq = GetObjectRequest.builder()
-                        .bucket(bucket)
-                        .key(obj.key())
-                        .build();
+            // Count using S3 streaming - no download needed
+            try (Connection conn = getConnection()) {
+                // Configure S3
+                conn.createStatement().execute("INSTALL httpfs;");
+                conn.createStatement().execute("LOAD httpfs");
+                conn.createStatement().execute("SET s3_endpoint='localhost:9000'");
+                conn.createStatement().execute("SET s3_access_key_id='minioadmin'");
+                conn.createStatement().execute("SET s3_secret_access_key='minioadmin'");
+                conn.createStatement().execute("SET s3_use_ssl=false");
+                conn.createStatement().execute("SET s3_region='us-east-1'");
+                conn.createStatement().execute("SET s3_url_style='path'");
 
-                ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                s3Client.getObject(getReq).transferTo(baos);
-                byte[] parquetData = baos.toByteArray();
-
-                String tempFile = "/tmp/count_" + System.currentTimeMillis() + ".parquet";
-                java.nio.file.Files.write(java.nio.file.Path.of(tempFile), parquetData);
-
-                try (Connection conn = getConnection()) {
-                    ResultSet rs = conn.createStatement()
-                            .executeQuery("SELECT COUNT(*) FROM read_parquet('" + tempFile + "')");
-                    if (rs.next()) {
-                        total += rs.getInt(1);
+                for (String monthKey : parquetFiles) {
+                    try {
+                        String s3Path = String.format("s3://%s/audit/%s.parquet", bucket, monthKey);
+                        ResultSet rs = conn.createStatement()
+                                .executeQuery("SELECT COUNT(*) FROM read_parquet('" + s3Path + "')");
+                        if (rs.next()) {
+                            total += rs.getInt(1);
+                        }
+                    } catch (SQLException ignored) {
+                        // File might not exist
                     }
                 }
-
-                new File(tempFile).delete();
             }
 
         } catch (Exception e) {

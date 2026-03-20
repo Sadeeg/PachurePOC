@@ -78,10 +78,12 @@ class AuditBenchmarkTest {
         
         long estimatedTotalRecords = TARGET_TOTAL_SIZE_BYTES / RECORD_SIZE_BYTES;
         long estimatedTimeFor20GB = (long) (estimatedTotalRecords / recordsPerSecond / 1000 / 60);
+        long actualCount = auditService.count();
         
         System.out.println("\n--- Extrapolation to 20GB ---");
         System.out.println("Estimated records for 20GB: " + estimatedTotalRecords);
         System.out.println("Estimated time: " + estimatedTimeFor20GB + " minutes");
+        System.out.println("Actual records in DB: " + actualCount);
         
         assertTrue(auditService.count() >= testRecordCount);
     }
@@ -154,6 +156,7 @@ class AuditBenchmarkTest {
         
         System.out.println("\n--- Extrapolation to 20GB ---");
         System.out.println("Estimated storage for 20GB: " + formatBytes(estimatedStorageFor20GB));
+        System.out.println("Actual records in storage: " + recordCountDb);
         
         assertTrue(storageBytes > 0);
     }
